@@ -1,11 +1,23 @@
-streamlit>=1.28.0
-opencv-python>=4.8.0
-numpy>=1.24.0
-scipy>=1.10.0
-pandas>=2.0.0
-streamlit-webrtc>=0.47.0
-av>=10.0.0
-aiortc>=1.6.0
-pyopenssl>=23.0.0
-cryptography>=41.0.0
+# Framework principal
+streamlit==1.39.0
+
+# Visualização e gráficos
 plotly
+matplotlib
+altair
+
+# Processamento numérico e científico
+numpy
+scipy
+pandas
+
+# Câmera, vídeo e imagem
+opencv-python-headless
+streamlit-webrtc
+
+# Utilitários e rede
+requests
+
+# Para segurança e compatibilidade do servidor
+protobuf
+watchdog
