@@ -1,7 +1,7 @@
 streamlit==1.39.0
 streamlit-webrtc==0.47.7
 aiortc==1.9.0
-av==11.0.0
+av==10.0.0
 requests==2.32.3
 opencv-python-headless==4.10.0.84
 numpy==1.26.4
