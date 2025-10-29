@@ -1,23 +1,12 @@
-# Framework principal
 streamlit==1.39.0
-
-# Visualização e gráficos
-plotly
-matplotlib
-altair
-
-# Processamento numérico e científico
-numpy
-scipy
-pandas
-
-# Câmera, vídeo e imagem
-opencv-python-headless
 streamlit-webrtc
-
-# Utilitários e rede
+opencv-python-headless
+numpy
+pandas
+scipy
+plotly
+av
+aiortc
+pyopenssl
+cryptography
 requests
-
-# Para segurança e compatibilidade do servidor
-protobuf
-watchdog
