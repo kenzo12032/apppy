@@ -1,313 +1,218 @@
-import time
-from collections import deque
-from dataclasses import dataclass
-import av
+import streamlit as st
 import cv2
 import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-from scipy.signal import butter, filtfilt, find_peaks
-import streamlit as st
-import requests
+import threading
+import time
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
+import av
+from scipy.signal import detrend, butter, filtfilt
+from scipy.fft import fft, fftfreq
 
-# ==========================================================
-# CONFIGURAÇÃO DA PÁGINA
-# ==========================================================
-st.set_page_config(
-    page_title="PPG Cardíaco em Tempo Real",
-    page_icon="❤️",
-    layout="wide",
-)
 
-# ==========================================================
-# CSS / ESTILO
-# ==========================================================
+# Configuração Streamlit
+st.set_page_config(page_title="PPG Real-Time + Flash", layout="centered")
+st.title("💡 Monitor Cardíaco em Tempo Real")
+
+
+# CSS (coloquei para tentar tirar os botões, mas falhei miseravelmente)
 st.markdown(
     """
-<style>
-.main-header {
-    background: linear-gradient(90deg,#ff6b6b,#ee5a24);
-    padding:1rem;
-    border-radius:12px;
-    color:white;
-    margin-bottom:1rem;
-    text-align:center;
-}
-.metric-card {
-    background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);
-    padding:1rem;
-    border-radius:14px;
-    color:white;
-    text-align:center;
-}
-.status {
-    padding:.8rem;
-    border-radius:10px;
-    border-left:4px solid #00d4aa;
-    background:rgba(0,212,170,.10);
-}
-</style>
-""",
+    <style>
+    /* Esconde a linha "Running" / "Stopped" */
+    div[data-testid="stWebRTCStatus"] { 
+        display: none !important; 
+    }
+
+    /* Nova regra para esconder botões e seletor */
+    div[data-key="camera_flash"] {
+        .toolbar { display: none !important; }
+        button[title="Start"], button[title="Stop"] { display: none !important; }
+        select[title="Select device"] { display: none !important; }
+        label { display: none !important; }
+    }
+
+    /* Rotação do vídeo */
+    video {
+        transform: rotate(90deg);
+        object-fit: cover;
+        width: 100%;
+        height: 80vh;
+    }
+    </style>
+    """,
     unsafe_allow_html=True,
 )
 
-# ==========================================================
-# FUNÇÃO DE FILTRO (Butterworth)
-# ==========================================================
-def bandpass_filter(sig, low=0.8, high=3.0, fs=30.0):
-    sig = np.asarray(sig, dtype=float)
-    if sig.size < 8:
-        return sig - np.mean(sig)
-    nyq = 0.5 * fs
-    low = max(0.1, low)
-    high = min(high, 0.95 * nyq)
-    if nyq <= 0 or high <= low:
-        return sig - np.mean(sig)
-    wn = [low / nyq, high / nyq]
-    b, a = butter(2, wn, btype="band")
-    try:
-        return filtfilt(b, a, sig)
-    except Exception:
-        return sig - np.mean(sig)
+# Botão Ligar/Desligar Câmera
+if "camera_on" not in st.session_state:
+    st.session_state.camera_on = False
 
-# ==========================================================
-# TURNAUTOMÁTICO (Metered) — força TCP/443
-# ==========================================================
-@st.cache_resource
-def get_rtc_configuration():
-    """
-    Busca TURN automático via Metered e força relay (TCP/443)
-    para funcionar no Render (sem UDP).
-    """
-    try:
-        resp = requests.get("https://apppy.metered.live/api/v1/turn/credentials", timeout=5)
-        data = resp.json()
-        ice_servers = data.get("iceServers", [])
-        if not ice_servers:
-            raise RuntimeError("Nenhum servidor ICE retornado")
-        return {
-            "iceServers": ice_servers,
-            "iceTransportPolicy": "relay",  # força uso de TURN via TCP
-        }
-    except Exception as e:
-        st.warning(f"Falha ao buscar TURN ({e}), usando STUN Google.")
-        return {
-            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}],
-            "iceTransportPolicy": "all",
-        }
+st.toggle("Ligar/Desligar Câmera", key="camera_on")
 
-# ==========================================================
-# ESTADO COMPARTILHADO
-# ==========================================================
-@dataclass
-class SharedState:
-    buffer_G: deque
-    last_filtered: np.ndarray
-    last_peaks: np.ndarray
-    fps: float
-    bpm_fixed: float | None
-    bpm_collect: list
-    last_bpm: float | None
-    last_signal_ready: bool
 
-if "ppg_state" not in st.session_state:
-    st.session_state.ppg_state = SharedState(
-        buffer_G=deque(maxlen=100),
-        last_filtered=np.zeros(100),
-        last_peaks=np.array([], dtype=int),
-        fps=30.0,
-        bpm_fixed=None,
-        bpm_collect=[],
-        last_bpm=None,
-        last_signal_ready=False,
-    )
-
-if "history" not in st.session_state:
-    st.session_state.history = pd.DataFrame(columns=["Nome", "BPM", "Data", "Hora"])
-
-# ==========================================================
-# SIDEBAR
-# ==========================================================
-with st.sidebar:
-    st.markdown("### Configurações")
-    cam_choice = st.radio(
-        "Câmera", ["Traseira (environment)", "Frontal (user)"], index=0
-    )
-    facing_mode = "environment" if cam_choice.startswith("Traseira") else "user"
-    if st.button("Nova medição"):
-        s = st.session_state.ppg_state
-        s.bpm_fixed = None
-        s.bpm_collect = []
-        s.last_bpm = None
-
-# ==========================================================
-# HEADER
-# ==========================================================
-st.markdown(
-    """
-<div class="main-header">
-  <h1>PPG Cardíaco em Tempo Real</h1>
-  <p>Detecção do pulso via câmera do celular (com flash automático)</p>
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-# ==========================================================
-# WEBRTC IMPORT
-# ==========================================================
-try:
-    from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
-    WEBRTC_AVAILABLE = True
-except Exception as e:
-    webrtc_streamer = None
-    WebRtcMode = None
-    VideoProcessorBase = object
-    WEBRTC_AVAILABLE = False
-    st.error("Dependências WebRTC ausentes: instale streamlit-webrtc, aiortc, av")
-
-# ==========================================================
-# PROCESSADOR DE VÍDEO
-# ==========================================================
-class PPGProcessor(VideoProcessorBase):
+# Processador de vídeo
+class MeuProcessadorDeVideo(VideoProcessorBase):
     def __init__(self):
-        self.prev_time = time.time()
-        self.frame_counter = 0
-        self.fps = 30.0
+        self.buffer_R = []
+        self.buffer_G = []
+        self.buffer_B = []
+        self.buffer_size = 150
+        self.lock = threading.Lock()
+        self.bpm = 0.0
+        self.fps = 0.0
+        self.contador_frames = 0
+        self.tempo_espera = time.time()
+        self.alpha_suavizacao = 0.1
 
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img = frame.to_ndarray(format="bgr24")
-        h, w = img.shape[:2]
+    def recv(self, frame):
+        with self.lock:
+            img = frame.to_ndarray(format="bgr24")
+            h, w = img.shape[:2]
 
-        # ROI central
-        side = int(min(h, w) * 0.5)
-        y0, x0 = (h - side) // 2, (w - side) // 2
-        roi = img[y0:y0+side, x0:x0+side]
+            # ROI (Região de Interesse)
+            roi_size = min(h, w) // 3
+            x_i = (w - roi_size) // 2
+            y_i = (h - roi_size) // 2
+            roi = img[y_i : y_i + roi_size, x_i : x_i + roi_size]
 
-        self.frame_counter += 1
-        if self.frame_counter >= 30:
-            now = time.time()
-            elapsed = now - self.prev_time
-            if elapsed > 0:
-                self.fps = self.frame_counter / elapsed
-            self.frame_counter = 0
-            self.prev_time = now
+            # Lógica de detecção de dedo
+            if roi.size > 0:
+                mean_bgr = np.mean(roi, axis=(0, 1))
+                mean_red_value = mean_bgr[2]  # Canal Vermelho
+            else:
+                mean_red_value = 0
 
-        mean_bgr = np.mean(roi, axis=(0, 1))
-        B, G, R = mean_bgr
-        s: SharedState = st.session_state.ppg_state
-        s.fps = float(self.fps)
-        s.buffer_G.append(G)
+            RED_THRESHOLD = 220
+            if mean_red_value > RED_THRESHOLD:
+                # Dedo detectado
+                self.buffer_B.append(mean_bgr[0])
+                self.buffer_G.append(mean_bgr[1])
+                self.buffer_R.append(mean_bgr[2])
 
-        dedo = False
-        if len(s.buffer_G) >= 30:
-            dc = np.mean(s.buffer_G)
-            ac = np.std(list(s.buffer_G)[-10:])
-            snr_like = ac / (dc + 1e-9)
-            vermelho_min = 60.0
-            dedo = (R > G + vermelho_min) and (R > B + vermelho_min) and (snr_like > 0.005)
+                # Limita o tamanho do buffer
+                if len(self.buffer_R) > self.buffer_size:
+                    self.buffer_R.pop(0)
+                    self.buffer_G.pop(0)
+                    self.buffer_B.pop(0)
 
-        if len(s.buffer_G) == s.buffer_G.maxlen and dedo:
-            g = np.asarray(s.buffer_G, dtype=float)
-            g = g / (np.mean(g) + 1e-9)
-            g_ac = g - np.mean(g)
-            g_f = bandpass_filter(g_ac, low=0.8, high=3.0, fs=max(s.fps, 1.0))
-            min_dist = max(1, int(max(s.fps, 1.0) * 60.0 / 220.0))
-            peaks, _ = find_peaks(g_f, distance=min_dist)
-            s.last_filtered, s.last_peaks, s.last_signal_ready = g_f, peaks, True
+                self.contador_frames += 1
+                if self.contador_frames % 10 == 0:
+                    bpm_bruto = self.calcula_bpm()
+                    if bpm_bruto > 40:
+                        self.bpm = (
+                            bpm_bruto
+                            if self.bpm == 0
+                            else (
+                                bpm_bruto * self.alpha_suavizacao
+                                + self.bpm * (1.0 - self.alpha_suavizacao)
+                            )
+                        )
 
-            if len(peaks) > 1:
-                intervals = np.diff(peaks) / max(s.fps, 1.0)
-                bpm_now = 60.0 / np.mean(intervals)
-                if 40.0 < bpm_now < 180.0:
-                    if s.bpm_fixed is None:
-                        s.bpm_collect.append(bpm_now)
-                        if len(s.bpm_collect) >= 3:
-                            s.bpm_fixed = np.mean(s.bpm_collect)
-                            s.bpm_collect = []
-                    s.last_bpm = s.bpm_fixed or bpm_now
-                else:
-                    s.last_bpm = None
-        else:
-            s.last_signal_ready = False
+                # Calcula FPS
+                agora = time.time()
+                delta_t = agora - self.tempo_espera
+                if delta_t > 0:
+                    self.fps = 10 / delta_t
+                self.tempo_espera = agora
 
-        cv2.putText(img, f"BPM: {s.last_bpm:.1f}" if s.last_bpm else "BPM: --",
-                    (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
-        cv2.putText(img, f"FPS: {s.fps:.1f}", (w - 180, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+                # Mostra BPM
+                cv2.putText(
+                    img,
+                    f"BPM: {self.bpm:.1f}",
+                    (30, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (255, 255, 255),
+                    2,
+                )
+            else:
 
-# ==========================================================
-# INICIA STREAM
-# ==========================================================
-if WEBRTC_AVAILABLE:
-    webrtc_streamer(
-        key="ppg-stream",
-        mode=WebRtcMode.SENDRECV,
-        rtc_configuration=get_rtc_configuration(),
-        media_stream_constraints={
-            "video": {
-                "facingMode": facing_mode,
-                "torch": True,  # ativa flash no Android
-            },
-            "audio": False,
-        },
-        video_processor_factory=PPGProcessor,
-        async_processing=True,
-    )
-else:
-    st.error("streamlit-webrtc não disponível.")
+                # Dedo não detectado
+                if len(self.buffer_R) > 0:
+                    self.buffer_R.clear()
+                    self.buffer_G.clear()
+                    self.buffer_B.clear()
+                    self.bpm = 0.0
+                    self.contador_frames = 0
+                    self.tempo_espera = time.time()
 
-# ==========================================================
-# LAYOUT PRINCIPAL
-# ==========================================================
-col1, col2 = st.columns([2, 1])
-s = st.session_state.ppg_state
+                # Mostra instrução
+                cv2.putText(
+                    img,
+                    "Posicione o dedo",
+                    (30, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 255),
+                    2,
+                )
 
-with col2:
-    st.markdown("### Métricas")
-    st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-    st.metric("BPM", f"{s.last_bpm:.1f}" if s.last_bpm else "--")
-    st.metric("FPS", f"{s.fps:.1f}")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown("### Salvar Medição")
-    nome = st.text_input("Nome", "")
-    if st.button("Salvar"):
-        if s.bpm_fixed:
-            now = time.localtime()
-            row = {
-                "Nome": nome or "Sem nome",
-                "BPM": round(s.bpm_fixed, 2),
-                "Data": time.strftime("%Y-%m-%d", now),
-                "Hora": time.strftime("%H:%M:%S", now),
-            }
-            st.session_state.history = pd.concat(
-                [st.session_state.history, pd.DataFrame([row])], ignore_index=True
+            # Desenha ROI + FPS
+            cv2.rectangle(
+                img, (x_i, y_i), (x_i + roi_size, y_i + roi_size), (0, 255, 0), 2
             )
-            st.success(f"Salvo: {row['Nome']} - {row['BPM']} BPM")
-        else:
-            st.warning("Aguardando estabilizar o sinal (~3 amostras).")
+            cv2.putText(
+                img,
+                f"FPS: {self.fps:.1f}",
+                (30, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (255, 0, 0),
+                2,
+            )
 
-    st.markdown("---")
-    if not st.session_state.history.empty:
-        st.dataframe(st.session_state.history, hide_index=True, use_container_width=True)
-        csv = st.session_state.history.to_csv(index=False).encode("utf-8")
-        st.download_button("Baixar CSV", csv, "historico_bpm.csv", "text/csv")
-    else:
-        st.info("Nenhuma medição salva.")
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-with col1:
-    st.markdown("### Sinal PPG (tempo real)")
-    if s.last_signal_ready:
-        x = np.arange(len(s.last_filtered))
-        y = s.last_filtered
-        peaks = s.last_peaks
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name="PPG"))
-        if peaks.size > 0:
-            fig.add_trace(go.Scatter(x=x[peaks], y=y[peaks], mode="markers", name="Picos"))
-        fig.update_layout(height=320, margin=dict(l=30, r=30, t=30, b=30))
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.markdown('<div class="status">Posicione o dedo e aguarde estabilizar.</div>', unsafe_allow_html=True)
+    # Função de cálculo de BPM (Filtros e FFT)
+    def calcula_bpm(self):
+        if len(self.buffer_R) < 30:
+            return 0
+
+        Gnorm = np.array(self.buffer_G) / (np.mean(self.buffer_G) + 1e-9)
+        sinal_ac = -(Gnorm - np.mean(Gnorm))
+
+        try:
+            fs = self.fps
+            if fs < 1.0:
+                return 0
+
+            nyq = 0.5 * fs
+            b, a = butter(2, [0.7 / nyq, 3.5 / nyq], btype="band")
+            filtered = filtfilt(b, a, sinal_ac)
+
+            N = len(filtered)
+            yf = np.abs(fft(filtered))
+            xf = fftfreq(N, d=1 / fs)
+            bpm_vals = xf * 60
+            idx = (bpm_vals > 40) & (bpm_vals < 200)
+
+            if np.sum(idx) == 0:
+                return 0
+
+            peak_idx = np.argmax(yf[idx])
+            return bpm_vals[idx][peak_idx]
+
+        except:
+            return 0
+
+
+# Configuração WebRTC (Flash ligado)
+video_constraints = {
+    "video": {
+        "facingMode": {"ideal": "environment"},
+        "width": {"ideal": 1920},
+        "height": {"ideal": 1080},
+        "frameRate": {"ideal": 30},
+        "torch": True,
+    }
+}
+
+
+# Inicia o Streamer (CONTROLADO PELO BOTÃO TOGGLE)
+ctx = webrtc_streamer(
+    key="camera_flash",
+    video_processor_factory=MeuProcessadorDeVideo,
+    media_stream_constraints=video_constraints,
+    async_processing=True,
+    desired_playing_state=st.session_state.camera_on,
+)
